@@ -35,9 +35,17 @@ os.environ["JOBLIB_MULTIPROCESSING"] = "0"
 os.environ["JOBLIB_START_METHOD"] = "threading"
 
 # - third-party -------------------------------------------
-import keyboard, numpy as np, pandas as pd, pyperclip, pystray
+try:
+    import keyboard as _keyboard
+except Exception as exc:  # pragma: no cover - depends on host input stack
+    _keyboard = None
+    _keyboard_import_error = exc
+else:
+    _keyboard_import_error = None
+
+import numpy as np, pandas as pd, pyperclip, pystray
 import customtkinter as ctk
-from PIL import Image
+from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -111,6 +119,99 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+
+_keyboard_warning_emitted = False
+
+
+def _keyboard_unavailable_reason() -> str | None:
+    """Return why python-keyboard global hooks should not be used here.
+
+    The `keyboard` package reads Linux input devices directly and normally
+    requires root. Trying to bind anyway spams scary errors on ordinary Linux
+    desktop sessions, especially Wayland. Keep Windows behavior unchanged and
+    fail softly on Linux instead.
+    """
+    if _keyboard is None:
+        return f"python-keyboard is unavailable: {_keyboard_import_error}"
+    if sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() != 0:
+        return "global hotkeys via python-keyboard require root on Linux; hotkeys disabled for this session"
+    return None
+
+
+def _warn_keyboard_unavailable(reason: str) -> None:
+    global _keyboard_warning_emitted
+    if _keyboard_warning_emitted:
+        return
+    _keyboard_warning_emitted = True
+    logging.warning("%s", reason)
+
+
+def _add_global_hotkey(hotkey: str, callback: Callable, *, suppress: bool = False):
+    reason = _keyboard_unavailable_reason()
+    if reason:
+        _warn_keyboard_unavailable(reason)
+        return None
+    assert _keyboard is not None
+    return _keyboard.add_hotkey(hotkey, callback, suppress=suppress)
+
+
+def _remove_global_hotkey(handle) -> None:
+    if handle is None or _keyboard is None:
+        return
+    _keyboard.remove_hotkey(handle)
+
+
+def _keyboard_send(keys: str) -> bool:
+    reason = _keyboard_unavailable_reason()
+    if reason:
+        _warn_keyboard_unavailable(reason)
+        return False
+    _keyboard.send(keys)
+    return True
+
+
+def _keyboard_press_and_release(keys: str) -> bool:
+    reason = _keyboard_unavailable_reason()
+    if reason:
+        _warn_keyboard_unavailable(reason)
+        return False
+    _keyboard.press_and_release(keys)
+    return True
+
+
+def _keyboard_write(text: str) -> bool:
+    reason = _keyboard_unavailable_reason()
+    if reason:
+        _warn_keyboard_unavailable(reason)
+        return False
+    _keyboard.write(text)
+    return True
+
+
+def _set_window_icon(window) -> None:
+    """Set the StashSage window icon without crashing on Linux/Tk.
+
+    Tk's `iconbitmap()` only reliably accepts Windows ICO files on Windows.
+    On Linux it can raise `TclError: bitmap ... not defined`; use a Tk image
+    fallback there and always keep a Python reference to the image.
+    """
+    icon_path = Path(__file__).with_name("stashsage_logo.ico")
+    if sys.platform.startswith("win") and icon_path.is_file():
+        try:
+            window.iconbitmap(str(icon_path))
+            return
+        except Exception as exc:
+            logging.debug("iconbitmap failed for %s: %s", icon_path, exc)
+
+    try:
+        if icon_path.is_file():
+            with Image.open(icon_path) as img:
+                img = img.copy()
+            photo = ImageTk.PhotoImage(img)
+            window.iconphoto(True, photo)
+            window._stashsage_icon_img = photo  # keep reference alive for Tk
+    except Exception as exc:
+        logging.debug("iconphoto fallback failed for %s: %s", icon_path, exc)
 
 # - globals / constants -----------------------------------
 DEBUG = False
@@ -838,10 +939,7 @@ def _open_fi_popup(cat: str | None, seg: str | None, model_type: str) -> None:
                 break
     popup = ctk.CTkToplevel(root)
     popup.title(f"Mod Importances  —  {cat or ''}{('/' + seg) if seg else ''}")
-    try:
-        popup.iconbitmap(str(Path(__file__).with_name("stashsage_logo.ico")))
-    except Exception:
-        pass
+    _set_window_icon(popup)
     popup.geometry("980x600")
     popup.minsize(600, 400)
     # Ensure the FI window appears on top of the main GUI
@@ -1526,7 +1624,7 @@ def _extract_int_from_clipboard(text: str) -> Optional[int]:
 def _handle_hotkey_copy_price(_=None) -> None:
     global _cached_price_value
     try:
-        keyboard.send("ctrl+c")
+        _keyboard_send("ctrl+c")
         time.sleep(0.1)
         raw = pyperclip.paste()
         val = _extract_int_from_clipboard(raw)
@@ -1570,7 +1668,7 @@ def _handle_hotkey_paste_price(_=None) -> None:
     try:
         # single-hotkey flow: copy -> compute -> replace (type), no clipboard clobber
         try:
-            keyboard.send("ctrl+c")
+            _keyboard_send("ctrl+c")
         except Exception:
             pass
         text = _clipboard_text_with_retry(max_wait_ms=600, step_ms=60)
@@ -1584,11 +1682,11 @@ def _handle_hotkey_paste_price(_=None) -> None:
         adj = _apply_cut_rule(int(val), rule)
         # Replace current selection by typing (avoids relying on clipboard paste)
         try:
-            keyboard.send("backspace")
+            _keyboard_send("backspace")
             time.sleep(0.02)
         except Exception:
             pass
-        keyboard.write(str(adj))
+        _keyboard_write(str(adj))
     except Exception:
         logging.exception("paste_price failed")
 
@@ -1974,10 +2072,7 @@ def _show_filtered_filter_popup(ctx: dict) -> None:
 
     popup = ctk.CTkToplevel(root)
     popup.title('Filtered Mods for Nearest Items')
-    try:
-        popup.iconbitmap(str(Path(__file__).with_name('stashsage_logo.ico')))
-    except Exception:
-        pass
+    _set_window_icon(popup)
     popup.grab_set()
 
     frame = ctk.CTkFrame(popup)
@@ -3219,161 +3314,95 @@ def _render_mirror_rows(
 
 
 
+def _bind_hotkey(
+    *,
+    label: str,
+    desired: str,
+    default: str,
+    callback: Callable,
+    current_handle,
+):
+    """Bind a global hotkey with a fallback, returning the new handle or None."""
+    if current_handle is not None:
+        try:
+            _remove_global_hotkey(current_handle)
+        except Exception:
+            logging.debug("Previous %s hotkey removal failed", label, exc_info=True)
+
+    try:
+        handle = _add_global_hotkey(desired, callback, suppress=False)
+        if handle is not None:
+            logging.info("%s hotkey bound to %s", label, desired)
+        return handle
+    except Exception as exc:
+        logging.error("Failed to bind %s hotkey %r: %s", label, desired, exc)
+
+    if desired.lower() != default.lower():
+        try:
+            handle = _add_global_hotkey(default, callback, suppress=False)
+            if handle is not None:
+                logging.info("%s hotkey reverted to %s", label, default)
+            return handle
+        except Exception as fallback_exc:
+            logging.error(
+                "Could not bind fallback %s hotkey %r: %s",
+                label,
+                default,
+                fallback_exc,
+            )
+    return None
+
+
 def _bind_overlay_hotkey(custom: str | None) -> None:
     """Bind overlay hotkey to *custom* or default to ctrl+1 with fallback."""
     global _overlay_hotkey_handle
-
     desired = (custom or "").strip() or DEFAULT_OVERLAY_HOTKEY
-
-    if _overlay_hotkey_handle is not None:
-        try:
-            keyboard.remove_hotkey(_overlay_hotkey_handle)
-        except Exception:
-            logging.debug("Previous overlay hotkey removal failed", exc_info=True)
-        finally:
-            _overlay_hotkey_handle = None
-
-    try:
-        _overlay_hotkey_handle = keyboard.add_hotkey(
-            desired, _handle_hotkey_super, suppress=False
-        )
-        logging.info("Overlay hotkey bound to %s", desired)
-        return
-    except Exception as exc:
-        logging.error("Failed to bind overlay hotkey %r: %s", desired, exc)
-
-    if desired.lower() != DEFAULT_OVERLAY_HOTKEY:
-        try:
-            _overlay_hotkey_handle = keyboard.add_hotkey(
-                DEFAULT_OVERLAY_HOTKEY, _handle_hotkey_super, suppress=False
-            )
-            logging.info("Overlay hotkey reverted to %s", DEFAULT_OVERLAY_HOTKEY)
-        except Exception as fallback_exc:
-            logging.error(
-                "Could not bind fallback overlay hotkey %r: %s",
-                DEFAULT_OVERLAY_HOTKEY,
-                fallback_exc,
-            )
-            _overlay_hotkey_handle = None
-    else:
-        _overlay_hotkey_handle = None
+    _overlay_hotkey_handle = _bind_hotkey(
+        label="Overlay",
+        desired=desired,
+        default=DEFAULT_OVERLAY_HOTKEY,
+        callback=_handle_hotkey_super,
+        current_handle=_overlay_hotkey_handle,
+    )
 
 
 def _bind_filtered_overlay_hotkey(custom: str | None) -> None:
     """Bind filtered overlay hotkey to *custom* or the default with fallback."""
     global _filtered_overlay_hotkey_handle
-
     desired = (custom or "").strip() or DEFAULT_FILTERED_OVERLAY_HOTKEY
-
-    if _filtered_overlay_hotkey_handle is not None:
-        try:
-            keyboard.remove_hotkey(_filtered_overlay_hotkey_handle)
-        except Exception:
-            logging.debug("Previous filtered overlay hotkey removal failed", exc_info=True)
-        finally:
-            _filtered_overlay_hotkey_handle = None
-
-    try:
-        _filtered_overlay_hotkey_handle = keyboard.add_hotkey(
-            desired, _handle_hotkey_filtered, suppress=False
-        )
-        logging.info("Filtered overlay hotkey bound to %s", desired)
-        return
-    except Exception as exc:
-        logging.error("Failed to bind filtered overlay hotkey %r: %s", desired, exc)
-
-    if desired.lower() != DEFAULT_FILTERED_OVERLAY_HOTKEY:
-        try:
-            _filtered_overlay_hotkey_handle = keyboard.add_hotkey(
-                DEFAULT_FILTERED_OVERLAY_HOTKEY, _handle_hotkey_filtered, suppress=False
-            )
-            logging.info("Filtered overlay hotkey reverted to %s", DEFAULT_FILTERED_OVERLAY_HOTKEY)
-        except Exception as fallback_exc:
-            logging.error("Could not bind fallback filtered overlay hotkey %r: %s", DEFAULT_FILTERED_OVERLAY_HOTKEY, fallback_exc)
-            _filtered_overlay_hotkey_handle = None
-    else:
-        _filtered_overlay_hotkey_handle = None
+    _filtered_overlay_hotkey_handle = _bind_hotkey(
+        label="Filtered overlay",
+        desired=desired,
+        default=DEFAULT_FILTERED_OVERLAY_HOTKEY,
+        callback=_handle_hotkey_filtered,
+        current_handle=_filtered_overlay_hotkey_handle,
+    )
 
 
 def _bind_discord_api_hotkey(custom: str | None) -> None:
     """Bind Discord API hotkey to *custom* or the default with fallback."""
     global _discord_api_hotkey_handle
-
+    desired = (custom or "").strip() or DEFAULT_DISCORD_API_HOTKEY
+    _discord_api_hotkey_handle = _bind_hotkey(
+        label="Discord API",
+        desired=desired,
+        default=DEFAULT_DISCORD_API_HOTKEY,
+        callback=_handle_hotkey_discord_api,
+        current_handle=_discord_api_hotkey_handle,
+    )
 
 
 def _bind_prediction_log_hotkey(custom: str | None) -> None:
     """Bind prediction log hotkey to *custom* or default with fallback."""
     global _prediction_log_hotkey_handle
-
     desired = (custom or "").strip() or "ctrl+3"
-
-    if _prediction_log_hotkey_handle is not None:
-        try:
-            keyboard.remove_hotkey(_prediction_log_hotkey_handle)
-        except Exception:
-            logging.debug("Previous prediction log hotkey removal failed", exc_info=True)
-        finally:
-            _prediction_log_hotkey_handle = None
-
-    try:
-        _prediction_log_hotkey_handle = keyboard.add_hotkey(
-            desired, _handle_hotkey_prediction_log, suppress=False
-        )
-        logging.info("Prediction log hotkey bound to %s", desired)
-        return
-    except Exception as exc:
-        logging.error("Failed to bind prediction log hotkey %r: %s", desired, exc)
-
-    if desired.lower() != "ctrl+3":
-        try:
-            _prediction_log_hotkey_handle = keyboard.add_hotkey(
-                "ctrl+3", _handle_hotkey_prediction_log, suppress=False
-            )
-            logging.info("Prediction log hotkey reverted to %s", "ctrl+3")
-        except Exception as fallback_exc:
-            logging.error(
-                "Could not bind fallback prediction log hotkey %r: %s",
-                "ctrl+3",
-                fallback_exc,
-            )
-            _prediction_log_hotkey_handle = None
-    else:
-        _prediction_log_hotkey_handle = None
-
-    desired = (custom or "").strip() or DEFAULT_DISCORD_API_HOTKEY
-
-    if _discord_api_hotkey_handle is not None:
-        try:
-            keyboard.remove_hotkey(_discord_api_hotkey_handle)
-        except Exception:
-            logging.debug("Previous Discord API hotkey removal failed", exc_info=True)
-        finally:
-            _discord_api_hotkey_handle = None
-
-    try:
-        _discord_api_hotkey_handle = keyboard.add_hotkey(
-            desired, _handle_hotkey_discord_api, suppress=False
-        )
-        logging.info("Discord API hotkey bound to %s", desired)
-        return
-    except Exception as exc:
-        logging.error("Failed to bind Discord API hotkey %r: %s", desired, exc)
-
-    if desired.lower() != DEFAULT_DISCORD_API_HOTKEY:
-        try:
-            _discord_api_hotkey_handle = keyboard.add_hotkey(
-                DEFAULT_DISCORD_API_HOTKEY, _handle_hotkey_discord_api, suppress=False
-            )
-            logging.info("Discord API hotkey reverted to %s", DEFAULT_DISCORD_API_HOTKEY)
-        except Exception as fallback_exc:
-            logging.error(
-                "Could not bind fallback Discord API hotkey %r: %s",
-                DEFAULT_DISCORD_API_HOTKEY,
-                fallback_exc,
-            )
-            _discord_api_hotkey_handle = None
-    else:
-        _discord_api_hotkey_handle = None
+    _prediction_log_hotkey_handle = _bind_hotkey(
+        label="Prediction log",
+        desired=desired,
+        default="ctrl+3",
+        callback=_handle_hotkey_prediction_log,
+        current_handle=_prediction_log_hotkey_handle,
+    )
 
 
 # ------------- UNSUPERVISED overlay (Ã¢â‚¬Å“Price MirrorÃ¢â‚¬Â) ----
@@ -3399,11 +3428,7 @@ def _show_unsuper_overlay(
     overlay = ctk.CTkToplevel(root)
     state.overlay = overlay
     overlay.images = []
-    try:
-        _ico = str(Path(__file__).with_name("stashsage_logo.ico"))
-        overlay.iconbitmap(_ico)
-    except Exception:
-        pass
+    _set_window_icon(overlay)
     overlay.title("Price Mirror")
     overlay.bind("<Escape>", lambda _e: _destroy_overlay())
     overlay.attributes("-topmost", True)
@@ -3481,12 +3506,8 @@ def _show_super_overlay(
     state.overlay = overlay
     overlay.images = []
     ov = overlay
-    # Set window icon to match main app (Windows-friendly ICO)
-    try:
-        _ico = str(Path(__file__).with_name("stashsage_logo.ico"))
-        ov.iconbitmap(_ico)
-    except Exception:
-        pass
+    # Set window icon to match main app without crashing on Linux/Tk.
+    _set_window_icon(ov)
     ov.title(f"StashSage Price Predictions  —  {item}")
     ov.bind("<Escape>", lambda _e: _destroy_overlay())
     ov.attributes("-topmost", True)
@@ -4053,7 +4074,7 @@ def _process_dashboard_gui(text: str) -> None:
 
 
 def _handle_hotkey_super(_=None):
-    keyboard.press_and_release("ctrl+c")
+    _keyboard_press_and_release("ctrl+c")
     root.after(
         200,
         lambda: _run_with_lock(
@@ -4063,7 +4084,7 @@ def _handle_hotkey_super(_=None):
 
 
 def _handle_hotkey_filtered(_=None):
-    keyboard.press_and_release("ctrl+c")
+    _keyboard_press_and_release("ctrl+c")
     root.after(
         200,
         lambda: _run_with_lock(
@@ -4087,7 +4108,7 @@ def _start_discord_api_send_async(text: str) -> None:
 
 
 def _handle_hotkey_discord_api(_=None):
-    keyboard.press_and_release("ctrl+c")
+    _keyboard_press_and_release("ctrl+c")
     root.after(
         200,
         lambda: _run_with_lock(
@@ -4386,8 +4407,7 @@ def run_tkinter_app(cfg: Optional[dict] = None) -> None:
     state.root = root
     root.title(f"StashSage for POE2 (v{__version__} -- {BUILD_DATE})")
     root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
-    icon_path = str(Path(__file__).with_name("stashsage_logo.ico"))
-    root.iconbitmap(icon_path)
+    _set_window_icon(root)
     # Also set a default iconphoto to propagate to child windows where supported
     try:
         png_path = Path(poe2trade_root) / "docs" / "stashsage_logo.png"
@@ -4723,11 +4743,7 @@ def _show_dashboard_overlay(
     ov = overlay
 
     # Window chrome
-    try:
-        _ico = str(Path(__file__).with_name("stashsage_logo.ico"))
-        ov.iconbitmap(_ico)
-    except Exception:
-        pass
+    _set_window_icon(ov)
     # Stable, centered window (no maximize) to avoid load-time reflow
     ov.title(f"StashSage Price Predictions  —  {item}")
     ov.bind("<Escape>", lambda _e: _destroy_overlay())
