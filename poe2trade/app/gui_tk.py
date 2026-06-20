@@ -4315,20 +4315,21 @@ def _refresh_log_files(cfg: dict) -> None:
 
 
 def _enable_services_if_ready(cfg: dict) -> None:
-    """Start background services when the supplied config has enough data."""
+    """Start Flask/background services once.
+
+    Flask provides the local trigger API even when Discord credentials are not
+    configured. The service manager itself decides whether to start the Discord
+    bot based on token/user-id presence.
+    """
     global SERVICES_STARTED
     if SERVICES_STARTED:
-        return
-    token = cfg.get("discord_bot_token", "").strip()
-    user_id = cfg.get("discord_user_id", "").strip()
-    if not (token and user_id and LOG_FILES):
         return
     try:
         start_services(cfg)
         SERVICES_STARTED = True
-        logging.info("Discord Flask + background services started.")
+        logging.info("Flask + optional Discord/background services started.")
     except Exception as exc:
-        logging.exception("Could not start Discord services: %s", exc)
+        logging.exception("Could not start Flask/Discord services: %s", exc)
 
 
 def _on_client_toggle(choice: str) -> None:
