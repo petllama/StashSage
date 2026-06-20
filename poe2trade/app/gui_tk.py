@@ -45,13 +45,14 @@ else:
 
 import numpy as np, pandas as pd, pyperclip, pystray
 import customtkinter as ctk
+from flask import jsonify as flask_jsonify, request as flask_request
 from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 # - project -----------------------------------------------
 from poe2trade.app import config_manager
-from poe2trade.app.discord_flask import start_services, update_config
+from poe2trade.app.discord_flask import app as flask_app, start_services, update_config
 from poe2trade.utils.chart_utils import (
     generate_bucket_confidence_plot,
     generate_predicted_overlay_with_marker,
@@ -4126,6 +4127,68 @@ def _handle_hotkey_prediction_log(_=None):
     )
 
 
+_local_hotkey_routes_registered = False
+
+
+def _register_local_hotkey_routes() -> None:
+    """Expose loopback-only trigger routes for KDE/global-shortcut helpers.
+
+    Python's `keyboard` module needs root on Linux, so KDE shortcuts can call a
+    tiny helper that copies the hovered item and posts it here. Flask runs in a
+    worker thread; all Tk work is scheduled back onto the Tk main loop.
+    """
+    global _local_hotkey_routes_registered
+    if _local_hotkey_routes_registered:
+        return
+    _local_hotkey_routes_registered = True
+
+    @flask_app.route("/local-hotkey/<action>", methods=["POST"])
+    def _route_local_hotkey(action: str):
+        if flask_request.remote_addr not in ("127.0.0.1", "::1"):
+            return flask_jsonify({"status": "forbidden"}), 403
+
+        data = flask_request.get_json(silent=True) or {}
+        text = str(data.get("item_text") or "")
+        action_key = str(action or "").strip().lower().replace("_", "-")
+
+        if action_key in ("overlay", "super"):
+            if not text.strip():
+                return flask_jsonify({"status": "error", "error": "item_text is required"}), 400
+            root.after(
+                0,
+                lambda: _run_with_lock(_hotkey_busy["super"], _score_dashboard_async, text),
+            )
+        elif action_key in ("filtered", "filtered-overlay"):
+            if not text.strip():
+                return flask_jsonify({"status": "error", "error": "item_text is required"}), 400
+            root.after(
+                0,
+                lambda: _run_with_lock(
+                    _hotkey_busy["filtered"], _start_filtered_overlay_async, text
+                ),
+            )
+        elif action_key in ("discord", "discord-api"):
+            if not text.strip():
+                return flask_jsonify({"status": "error", "error": "item_text is required"}), 400
+            root.after(
+                0,
+                lambda: _run_with_lock(
+                    _hotkey_busy["discord_api"], _start_discord_api_send_async, text
+                ),
+            )
+        elif action_key in ("history", "prediction-log"):
+            root.after(
+                0,
+                lambda: _run_with_lock(
+                    _hotkey_busy["prediction_log"], _show_prediction_log_popup
+                ),
+            )
+        else:
+            return flask_jsonify({"status": "error", "error": f"unknown action: {action}"}), 404
+
+        return flask_jsonify({"status": "accepted", "action": action_key})
+
+
 
 
 
@@ -4660,6 +4723,7 @@ def run_tkinter_app(cfg: Optional[dict] = None) -> None:
     ).pack(side="left", expand=True, fill="x", padx=(8, 0))
 
     # _refresh_log_files(state.config)
+    _register_local_hotkey_routes()
     _enable_services_if_ready(state.config)
     _bind_price_hotkeys()
     _auto_resize_root()
